@@ -1,0 +1,496 @@
+diff --git a/Makefile b/Makefile
+index 09d790c..7f6d8f7 100644
+--- a/Makefile
++++ b/Makefile
+@@ -181,6 +181,7 @@ UPROGS=\
+ 	_usertests\
+ 	_wc\
+ 	_zombie\
++	_threadtest\
+ 
+ fs.img: mkfs README $(UPROGS)
+ 	./mkfs fs.img README $(UPROGS)
+diff --git a/defs.h b/defs.h
+index 82fb982..eab6b0e 100644
+--- a/defs.h
++++ b/defs.h
+@@ -104,9 +104,11 @@ int             pipewrite(struct pipe*, char*, int);
+ //PAGEBREAK: 16
+ // proc.c
+ int             cpuid(void);
++int             clone(void (*)(void*), void*, void*, void (*)(void));
+ void            exit(void);
+ int             fork(void);
+ int             growproc(int);
++int             join(void);
+ int             kill(int);
+ struct cpu*     mycpu(void);
+ struct proc*    myproc();
+diff --git a/proc.c b/proc.c
+index 806b1b1..305641a 100644
+--- a/proc.c
++++ b/proc.c
+@@ -20,6 +20,31 @@ extern void trapret(void);
+ 
+ static void wakeup1(void *chan);
+ 
++// Reclaim a process-table entry while ptable.lock is held. Address spaces
++// are released separately by wait(), and are never owned by thread entries.
++static void
++freeproc(struct proc *p)
++{
++  if(p->kstack)
++    kfree(p->kstack);
++  p->sz = 0;
++  p->pgdir = 0;
++  p->kstack = 0;
++  p->state = UNUSED;
++  p->pid = 0;
++  p->parent = 0;
++  p->is_thread = 0;
++  p->group_leader = 0;
++  p->group_threads = 0;
++  p->tf = 0;
++  p->context = 0;
++  p->chan = 0;
++  p->killed = 0;
++  p->cwd = 0;
++  p->name[0] = 0;
++  memset(p->ofile, 0, sizeof(p->ofile));
++}
++
+ void
+ pinit(void)
+ {
+@@ -88,12 +113,27 @@ allocproc(void)
+ found:
+   p->state = EMBRYO;
+   p->pid = nextpid++;
++  p->sz = 0;
++  p->pgdir = 0;
++  p->parent = 0;
++  p->is_thread = 0;
++  p->group_leader = p;
++  p->group_threads = 0;
++  p->tf = 0;
++  p->context = 0;
++  p->chan = 0;
++  p->killed = 0;
++  p->cwd = 0;
++  p->name[0] = 0;
++  memset(p->ofile, 0, sizeof(p->ofile));
+ 
+   release(&ptable.lock);
+ 
+   // Allocate kernel stack.
+   if((p->kstack = kalloc()) == 0){
+-    p->state = UNUSED;
++    acquire(&ptable.lock);
++    freeproc(p);
++    release(&ptable.lock);
+     return 0;
+   }
+   sp = p->kstack + KSTACKSIZE;
+@@ -221,6 +261,74 @@ fork(void)
+   return pid;
+ }
+ 
++// Create a thread that shares the caller's page table and has an independent
++// kernel stack. stack is the page-aligned base of a writable user stack page;
++// the user wrapper supplies a return trampoline as the fourth syscall word.
++int
++clone(void (*fcn)(void*), void *arg, void *stack, void (*ret)(void))
++{
++  int i, pid;
++  uint top, sp, value;
++  struct proc *np;
++  struct proc *curproc = myproc();
++
++  if(fcn == 0 || ret == 0 || stack == 0)
++    return -1;
++  if(((uint)stack % PGSIZE) != 0 || (uint)stack + PGSIZE < (uint)stack ||
++     (uint)stack + PGSIZE > curproc->sz)
++    return -1;
++  if(uva2ka(curproc->pgdir, (char*)fcn) == 0 ||
++     uva2ka(curproc->pgdir, (char*)ret) == 0 ||
++     uva2ka(curproc->pgdir, (char*)stack) == 0 ||
++     uva2ka(curproc->pgdir, (char*)((uint)stack + PGSIZE - 1)) == 0)
++    return -1;
++  if(arg && uva2ka(curproc->pgdir, (char*)arg) == 0)
++    return -1;
++
++  if((np = allocproc()) == 0)
++    return -1;
++
++  np->pgdir = curproc->pgdir;
++  np->sz = curproc->sz;
++  np->parent = curproc;
++  np->is_thread = 1;
++  np->group_leader = curproc->group_leader;
++  *np->tf = *curproc->tf;
++  np->tf->eip = (uint)fcn;
++  np->tf->eax = 0;
++
++  // A normal cdecl entry sees [return address, arg] at its initial ESP.
++  top = (uint)stack + PGSIZE;
++  sp = top - sizeof(uint);
++  value = (uint)arg;
++  if(copyout(np->pgdir, sp, &value, sizeof(value)) < 0)
++    goto badclone;
++  sp -= sizeof(uint);
++  value = (uint)ret;
++  if(copyout(np->pgdir, sp, &value, sizeof(value)) < 0)
++    goto badclone;
++  np->tf->esp = sp;
++
++  for(i = 0; i < NOFILE; i++)
++    if(curproc->ofile[i])
++      np->ofile[i] = filedup(curproc->ofile[i]);
++  np->cwd = idup(curproc->cwd);
++  safestrcpy(np->name, curproc->name, sizeof(np->name));
++  pid = np->pid;
++
++  acquire(&ptable.lock);
++  np->group_leader->group_threads++;
++  np->state = RUNNABLE;
++  release(&ptable.lock);
++  return pid;
++
++badclone:
++  acquire(&ptable.lock);
++  freeproc(np);
++  release(&ptable.lock);
++  return -1;
++}
++
+ // Exit the current process.  Does not return.
+ // An exited process remains in the zombie state
+ // until its parent calls wait() to find out it exited.
+@@ -252,15 +360,44 @@ exit(void)
+   // Parent might be sleeping in wait().
+   wakeup1(curproc->parent);
+ 
+-  // Pass abandoned children to init.
++  // A leader exit stops its remaining threads. Their group stays alive until
++  // they reach exit; wait() will then reclaim the shared address space once.
++  if(!curproc->is_thread){
++    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++      if(p != curproc && p->is_thread &&
++         p->group_leader == curproc && p->state != UNUSED &&
++         p->state != ZOMBIE){
++        p->killed = 1;
++        if(p->state == SLEEPING)
++          p->state = RUNNABLE;
++      }
++    }
++  }
++
++  // Pass abandoned process children to init. Thread children of an exiting
++  // worker are adopted by the group leader so join() can reclaim them.
+   for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+     if(p->parent == curproc){
+-      p->parent = initproc;
+-      if(p->state == ZOMBIE)
+-        wakeup1(initproc);
++      if(p->is_thread){
++        if(curproc->is_thread)
++          p->parent = curproc->group_leader;
++      } else {
++        p->parent = initproc;
++        if(p->state == ZOMBIE)
++          wakeup1(initproc);
++      }
+     }
+   }
+ 
++  if(curproc->is_thread){
++    struct proc *leader = curproc->group_leader;
++    curproc->pgdir = 0;        // The leader owns and eventually frees pgdir.
++    if(leader->group_threads > 0)
++      leader->group_threads--;
++    if(leader->group_threads == 0)
++      wakeup1(leader->parent);
++  }
++
+   // Jump into the scheduler, never to return.
+   curproc->state = ZOMBIE;
+   sched();
+@@ -272,7 +409,7 @@ exit(void)
+ int
+ wait(void)
+ {
+-  struct proc *p;
++  struct proc *p, *q;
+   int havekids, pid;
+   struct proc *curproc = myproc();
+   
+@@ -283,18 +420,19 @@ wait(void)
+     for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+       if(p->parent != curproc)
+         continue;
++      if(p->is_thread)
++        continue;             // Only join() reaps threads.
+       havekids = 1;
+-      if(p->state == ZOMBIE){
++      if(p->state == ZOMBIE && p->group_threads == 0){
+         // Found one.
+         pid = p->pid;
+-        kfree(p->kstack);
+-        p->kstack = 0;
++        // The leader may have exited before its threads; discard their
++        // unjoined zombies now that no thread can still reference this group.
++        for(q = ptable.proc; q < &ptable.proc[NPROC]; q++)
++          if(q->is_thread && q->group_leader == p && q->state == ZOMBIE)
++            freeproc(q);
+         freevm(p->pgdir);
+-        p->pid = 0;
+-        p->parent = 0;
+-        p->name[0] = 0;
+-        p->killed = 0;
+-        p->state = UNUSED;
++        freeproc(p);
+         release(&ptable.lock);
+         return pid;
+       }
+@@ -311,6 +449,37 @@ wait(void)
+   }
+ }
+ 
++// Wait for a child created by clone() and reclaim only its private kernel
++// resources. Shared user memory belongs to the address-space leader.
++int
++join(void)
++{
++  struct proc *p;
++  int havekids, pid;
++  struct proc *curproc = myproc();
++
++  acquire(&ptable.lock);
++  for(;;){
++    havekids = 0;
++    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++      if(p->parent != curproc || !p->is_thread)
++        continue;
++      havekids = 1;
++      if(p->state == ZOMBIE){
++        pid = p->pid;
++        freeproc(p);
++        release(&ptable.lock);
++        return pid;
++      }
++    }
++    if(!havekids || curproc->killed){
++      release(&ptable.lock);
++      return -1;
++    }
++    sleep(curproc, &ptable.lock);
++  }
++}
++
+ //PAGEBREAK: 42
+ // Per-CPU process scheduler.
+ // Each CPU calls scheduler() after setting itself up.
+diff --git a/proc.h b/proc.h
+index 1647114..44683d4 100644
+--- a/proc.h
++++ b/proc.h
+@@ -42,6 +42,9 @@ struct proc {
+   enum procstate state;        // Process state
+   int pid;                     // Process ID
+   struct proc *parent;         // Parent process
++  int is_thread;               // Shares the address space with group_leader
++  struct proc *group_leader;   // Process that owns this address space
++  int group_threads;           // Live threads in this address-space group
+   struct trapframe *tf;        // Trap frame for current syscall
+   struct context *context;     // swtch() here to run process
+   void *chan;                  // If non-zero, sleeping on chan
+diff --git a/syscall.c b/syscall.c
+index ee85261..d69016c 100644
+--- a/syscall.c
++++ b/syscall.c
+@@ -83,6 +83,7 @@ argstr(int n, char **pp)
+ }
+ 
+ extern int sys_chdir(void);
++extern int sys_clone(void);
+ extern int sys_close(void);
+ extern int sys_dup(void);
+ extern int sys_exec(void);
+@@ -91,6 +92,7 @@ extern int sys_fork(void);
+ extern int sys_fstat(void);
+ extern int sys_getpid(void);
+ extern int sys_kill(void);
++extern int sys_join(void);
+ extern int sys_link(void);
+ extern int sys_mkdir(void);
+ extern int sys_mknod(void);
+@@ -126,6 +128,8 @@ static int (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_clone]   sys_clone,
++[SYS_join]    sys_join,
+ };
+ 
+ void
+diff --git a/syscall.h b/syscall.h
+index bc5f356..6b757d1 100644
+--- a/syscall.h
++++ b/syscall.h
+@@ -20,3 +20,5 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_clone  22
++#define SYS_join   23
+diff --git a/sysproc.c b/sysproc.c
+index 0686d29..41bc920 100644
+--- a/sysproc.c
++++ b/sysproc.c
+@@ -13,6 +13,24 @@ sys_fork(void)
+   return fork();
+ }
+ 
++int
++sys_clone(void)
++{
++  int fcn, arg, stack, ret;
++
++  if(argint(0, &fcn) < 0 || argint(1, &arg) < 0 ||
++     argint(2, &stack) < 0 || argint(3, &ret) < 0)
++    return -1;
++  return clone((void (*)(void*))fcn, (void*)arg, (void*)stack,
++               (void (*)(void))ret);
++}
++
++int
++sys_join(void)
++{
++  return join();
++}
++
+ int
+ sys_exit(void)
+ {
+diff --git a/threadtest.c b/threadtest.c
+new file mode 100644
+index 0000000..6da669f
+--- /dev/null
++++ b/threadtest.c
+@@ -0,0 +1,55 @@
++#include "types.h"
++#include "stat.h"
++#include "user.h"
++
++#define NTHREADS 3
++#define STACKSIZE 4096
++#define ITERATIONS 100000
++
++// One page per thread, aligned so clone() can validate each stack page.
++static char stacks[NTHREADS][STACKSIZE] __attribute__((aligned(4096)));
++static int worker_ids[NTHREADS];
++static volatile int counter;
++
++static void
++worker(void *arg)
++{
++  int id = *(int*)arg;
++  int i, old, delay;
++
++  for(i = 0; i < ITERATIONS; i++){
++    old = counter;
++    // Widen the load/store window so the unsynchronized race is observable
++    // on the two-CPU xv6 run used for the screenshot.
++    for(delay = 0; delay < 500; delay++)
++      __asm__ volatile("nop");
++    counter = old + 1;
++  }
++  printf(1, "thread %d done\n", id);
++}
++
++int
++main(void)
++{
++  int i, pid;
++
++  printf(1, "Q1: 3 threads x %d unsynchronized increments\n", ITERATIONS);
++  for(i = 0; i < NTHREADS; i++){
++    worker_ids[i] = i;
++    pid = clone(worker, &worker_ids[i], stacks[i]);
++    if(pid < 0){
++      printf(1, "clone failed for thread %d\n", i);
++      exit();
++    }
++    printf(1, "created thread %d pid=%d\n", i, pid);
++  }
++  for(i = 0; i < NTHREADS; i++)
++    if(join() < 0){
++      printf(1, "join failed\n");
++      exit();
++    }
++
++  printf(1, "Q1 result: counter=%d (expected 300000 without lost updates)\n",
++         counter);
++  exit();
++}
+diff --git a/ulib.c b/ulib.c
+index 8e1e1a2..7675044 100644
+--- a/ulib.c
++++ b/ulib.c
+@@ -4,6 +4,22 @@
+ #include "user.h"
+ #include "x86.h"
+ 
++extern int __clone(void (*)(void*), void*, void*, void (*)(void));
++
++static void
++thread_exit(void)
++{
++  exit();
++}
++
++// Keep the public API at the requested three arguments. The hidden return
++// trampoline makes a thread that returns from its start routine call exit().
++int
++clone(void (*fcn)(void*), void *arg, void *stack)
++{
++  return __clone(fcn, arg, stack, thread_exit);
++}
++
+ char*
+ strcpy(char *s, const char *t)
+ {
+diff --git a/user.h b/user.h
+index 4f99c52..6f0455d 100644
+--- a/user.h
++++ b/user.h
+@@ -3,6 +3,8 @@ struct rtcdate;
+ 
+ // system calls
+ int fork(void);
++int clone(void (*fcn)(void*), void *arg, void *stack);
++int join(void);
+ int exit(void) __attribute__((noreturn));
+ int wait(void);
+ int pipe(int*);
+diff --git a/usys.S b/usys.S
+index 8bfd8a1..a62d7b6 100644
+--- a/usys.S
++++ b/usys.S
+@@ -9,6 +9,11 @@
+     ret
+ 
+ SYSCALL(fork)
++.globl __clone
++__clone:
++  movl $SYS_clone, %eax
++  int $T_SYSCALL
++  ret
+ SYSCALL(exit)
+ SYSCALL(wait)
+ SYSCALL(pipe)
+@@ -29,3 +34,4 @@ SYSCALL(getpid)
+ SYSCALL(sbrk)
+ SYSCALL(sleep)
+ SYSCALL(uptime)
++SYSCALL(join)

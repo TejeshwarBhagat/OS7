@@ -1,0 +1,150 @@
+Lab 7 verification output
+xv6-public commit: eeb7b415dbcb12cc362d0783e41c3d1f44066b17
+Q1–Q3: QEMU with CPUS=2. Q4: QEMU with CPUS=1.
+
+Q1 — Shared address-space threads
+QEMU CPUS=2
+$ threadtest
+Q1: 3 threads x 100000 unsynchronized increments
+created thread 0 pid=4
+created thread 1 pid=5
+created thread 2 pid=6
+thread 1 done
+thread 0 done
+thread 2 done
+Q1 result: counter=203864 (expected 300000 without lost updates)
+
+Q2 — Semaphores and producer-consumer
+QEMU CPUS=2
+$ synctest
+Q2: protected counter, 3 threads x 100000 increments
+Q2 counter result: 300000 (expected 300000)
+produced 1
+produced 2
+produced 3
+produced 4
+produced 5
+consumed 1
+consumed 2
+consumed 3
+consumed 4
+consumed 5
+produced 6
+produced 7
+consumed 6
+produced 8
+consumed 7
+produced 9
+consumed 8
+produced 10
+consumed 9
+produced 11
+consumed 10
+produced 12
+consumed 11
+consumed 12
+Q2 producer-consumer complete: 12 items, buffer size 5
+
+Q3 — Deadlock detection and Banker safety
+QEMU CPUS=2
+$ deadlock
+Q3: resource deadlock detection and Banker's safety
+
+Test 1: circular wait
+Available=[0 0]
+Allocation:
+  P0 [1 0]
+  P1 [0 1]
+  P2 [1 0]
+Need/Request:
+  P0 [0 1]
+  P1 [1 0]
+  P2 [0 1]
+Detection starts with Work=[0 0]
+Deadlocked processes: P0 P1 P2
+
+Test 2: safe allocation
+Available=[0 0]
+Allocation:
+  P0 [1 0]
+  P1 [0 1]
+  P2 [1 1]
+Need/Request:
+  P0 [0 1]
+  P1 [1 0]
+  P2 [0 0]
+Detection starts with Work=[0 0]
+  P2 can finish: Request=[0 0] Work=[0 0]
+  P2 releases allocation; Work=[1 1]
+  P0 can finish: Request=[0 1] Work=[1 1]
+  P0 releases allocation; Work=[2 1]
+  P1 can finish: Request=[1 0] Work=[2 1]
+  P1 releases allocation; Work=[2 2]
+Result: no deadlock
+
+Test 3: initially safe Banker state
+Available=[1 1]
+Allocation:
+  P0 [1 0]
+  P1 [0 1]
+Need/Request:
+  P0 [1 1]
+  P1 [2 0]
+Safety check starts with Work=[1 1]
+  P0 Need=[1 1] fits Work=[1 1]
+  P0 finishes; Work=[2 1]
+  P1 Need=[2 0] fits Work=[2 1]
+  P1 finishes; Work=[2 2]
+Initial state is safe
+
+Hypothetical state after request:
+Available=[0 1]
+Allocation:
+  P0 [1 0]
+  P1 [1 1]
+Need/Request:
+  P0 [1 1]
+  P1 [1 0]
+Safety check starts with Work=[0 1]
+Request denied: hypothetical state is unsafe
+
+Actual pipe circular wait:
+Process A holds Pipe1 writer; waits to read Pipe2
+Process B holds Pipe2 writer; waits to read Pipe1
+Both readers are blocked; resource model reports: Detection starts with Work=[0 0]
+A -> Pipe2 -> B -> Pipe1 -> A (deadlock)
+Pipe demo cleaned up
+
+Q4 — Priority scheduling and aging
+QEMU CPUS=1
+$ priotest
+Q4: priority preemption and aging (1=high, 20=low)
+forked pid=4 priority=1
+forked pid=5 priority=5
+forked pid=6 priority=10
+forked pid=7 priority=20
+start pid=4 priority=1
+aging: pid 5 waited 31 ticks; priority 5->4
+aging: pid 6 waited 31 ticks; priority 10->9
+aging: pid 7 waited 31 ticks; priority 20->19
+aging: pid 5 waited 31 ticks; priority 4->3
+aging: pid 6 waited 31 ticks; priority 9->8
+aging: pid 7 waited 31 ticks; priority 19->18
+complete pid=4 priority=1 ticks=68
+start pid=5 priority=3
+aging: pid 6 waited 31 ticks; priority 8->7
+aging: pid 7 waited 31 ticks; priority 18->17
+aging: pid 3 waited 31 ticks; priority 10->9
+aging: pid 6 waited 31 ticks; priority 7->6
+aging: pid 7 waited 31 ticks; priority 17->16
+aging: pid 3 waited 31 ticks; priority 9->8
+complete pid=5 priority=3 ticks=68
+start pid=6 priority=6
+aging: pid 7 waited 31 ticks; priority 16->15
+aging: pid 3 waited 31 ticks; priority 8->7
+aging: pid 7 waited 31 ticks; priority 15->14
+aging: pid 3 waited 31 ticks; priority 7->6
+complete pid=6 priority=6 ticks=68
+start pid=7 priority=14
+complete pid=7 priority=14 ticks=67
+Q4 complete: all children finished; age events appear above

@@ -1,0 +1,255 @@
+diff --git a/Makefile b/Makefile
+index a710799..fb5e10e 100644
+--- a/Makefile
++++ b/Makefile
+@@ -184,6 +184,7 @@ UPROGS=\
+ 	_zombie\
+ 	_threadtest\
+ 	_synctest\
++	_deadlock\
+ 
+ fs.img: mkfs README $(UPROGS)
+ 	./mkfs fs.img README $(UPROGS)
+diff --git a/deadlock.c b/deadlock.c
+new file mode 100644
+index 0000000..5ce4935
+--- /dev/null
++++ b/deadlock.c
+@@ -0,0 +1,237 @@
++#include "types.h"
++#include "stat.h"
++#include "user.h"
++
++#define MAXP 3
++#define M 2
++
++static void
++print_vector(char *label, int v[M])
++{
++  printf(1, "%s[%d %d]\n", label, v[0], v[1]);
++}
++
++static void
++print_matrix(char *label, int n, int a[MAXP][M])
++{
++  int i;
++
++  printf(1, "%s\n", label);
++  for(i = 0; i < n; i++)
++    printf(1, "  P%d [%d %d]\n", i, a[i][0], a[i][1]);
++}
++
++static int
++fits(int request[M], int work[M])
++{
++  return request[0] <= work[0] && request[1] <= work[1];
++}
++
++// Return the number of unfinished processes; their indexes are copied to out.
++static int
++detect_deadlock(int n, int allocation[MAXP][M], int request[MAXP][M],
++                int available[M], int out[MAXP])
++{
++  int work[M], finish[MAXP], i, count, changed;
++
++  work[0] = available[0];
++  work[1] = available[1];
++  count = 0;
++  for(i = 0; i < n; i++)
++    finish[i] = 0;
++  printf(1, "Detection starts with Work=[%d %d]\n", work[0], work[1]);
++  do {
++    changed = 0;
++    for(i = 0; i < n; i++){
++      if(finish[i] || !fits(request[i], work))
++        continue;
++      printf(1, "  P%d can finish: Request=[%d %d] Work=[%d %d]\n",
++             i, request[i][0], request[i][1], work[0], work[1]);
++      work[0] += allocation[i][0];
++      work[1] += allocation[i][1];
++      finish[i] = 1;
++      changed = 1;
++      printf(1, "  P%d releases allocation; Work=[%d %d]\n",
++             i, work[0], work[1]);
++    }
++  } while(changed);
++
++  count = 0;
++  for(i = 0; i < n; i++)
++    if(!finish[i])
++      out[count++] = i;
++  return count;
++}
++
++static void
++print_state(char *title, int n, int allocation[MAXP][M],
++            int need[MAXP][M], int available[M])
++{
++  printf(1, "\n%s\n", title);
++  print_vector("Available=", available);
++  print_matrix("Allocation:", n, allocation);
++  print_matrix("Need/Request:", n, need);
++}
++
++static void
++compute_need(int n, int allocation[MAXP][M], int maximum[MAXP][M],
++             int need[MAXP][M])
++{
++  int i, j;
++  for(i = 0; i < n; i++)
++    for(j = 0; j < M; j++)
++      need[i][j] = maximum[i][j] - allocation[i][j];
++}
++
++static int
++is_safe_state(int n, int allocation[MAXP][M], int need[MAXP][M],
++              int available[M], int sequence[MAXP])
++{
++  int work[M], finish[MAXP], i, count, changed;
++
++  work[0] = available[0];
++  work[1] = available[1];
++  count = 0;
++  for(i = 0; i < n; i++)
++    finish[i] = 0;
++  printf(1, "Safety check starts with Work=[%d %d]\n", work[0], work[1]);
++  do {
++    changed = 0;
++    for(i = 0; i < n; i++){
++      if(finish[i] || !fits(need[i], work))
++        continue;
++      printf(1, "  P%d Need=[%d %d] fits Work=[%d %d]\n",
++             i, need[i][0], need[i][1], work[0], work[1]);
++      work[0] += allocation[i][0];
++      work[1] += allocation[i][1];
++      finish[i] = 1;
++      sequence[count++] = i;
++      changed = 1;
++      printf(1, "  P%d finishes; Work=[%d %d]\n", i, work[0], work[1]);
++    }
++  } while(changed);
++
++  return count == n;
++}
++
++static int
++banker_request(int n, int pid, int req[M], int allocation[MAXP][M],
++               int need[MAXP][M], int available[M], int sequence[MAXP])
++{
++  int olda[M], oldv[M], j;
++
++  for(j = 0; j < M; j++){
++    if(req[j] > need[pid][j] || req[j] > available[j]){
++      printf(1, "Request rejected: exceeds Need or Available\n");
++      return 0;
++    }
++    olda[j] = allocation[pid][j];
++    oldv[j] = available[j];
++    allocation[pid][j] += req[j];
++    need[pid][j] -= req[j];
++    available[j] -= req[j];
++  }
++  print_state("Hypothetical state after request:", n, allocation, need,
++              available);
++  if(is_safe_state(n, allocation, need, available, sequence)){
++    printf(1, "Request granted; safe sequence:");
++    for(j = 0; j < n; j++)
++      printf(1, " P%d", sequence[j]);
++    printf(1, "\n");
++    return 1;
++  }
++  for(j = 0; j < M; j++){
++    allocation[pid][j] = olda[j];
++    available[j] = oldv[j];
++    need[pid][j] += req[j];
++  }
++  printf(1, "Request denied: hypothetical state is unsafe\n");
++  return 0;
++}
++
++static void
++pipe_deadlock_demo(int allocation[MAXP][M], int request[MAXP][M],
++                   int available[M])
++{
++  int p1[2], p2[2], a, b, dead[MAXP];
++  char byte;
++
++  printf(1, "\nActual pipe circular wait:\n");
++  if(pipe(p1) < 0 || pipe(p2) < 0){
++    printf(1, "pipe creation failed\n");
++    return;
++  }
++  a = fork();
++  if(a == 0){
++    close(p1[0]);
++    close(p2[1]);
++    printf(1, "Process A holds Pipe1 writer; waits to read Pipe2\n");
++    read(p2[0], &byte, 1);
++    exit();
++  }
++  if(a < 0){
++    printf(1, "fork A failed\n");
++    return;
++  }
++  b = fork();
++  if(b == 0){
++    close(p2[0]);
++    close(p1[1]);
++    printf(1, "Process B holds Pipe2 writer; waits to read Pipe1\n");
++    read(p1[0], &byte, 1);
++    exit();
++  }
++  if(b < 0){
++    printf(1, "fork B failed\n");
++    kill(a);
++    wait();
++    return;
++  }
++  close(p1[0]); close(p1[1]);
++  close(p2[0]); close(p2[1]);
++  sleep(4);                   // Let both readers block in piperead().
++  printf(1, "Both readers are blocked; resource model reports: ");
++  if(detect_deadlock(2, allocation, request, available, dead) == 2)
++    printf(1, "A -> Pipe2 -> B -> Pipe1 -> A (deadlock)\n");
++  kill(a); kill(b);           // Release the deliberately blocked children.
++  wait(); wait();
++  printf(1, "Pipe demo cleaned up\n");
++}
++
++int
++main(void)
++{
++  int dead_alloc[MAXP][M] = {{1,0}, {0,1}, {1,0}};
++  int dead_req[MAXP][M] = {{0,1}, {1,0}, {0,1}};
++  int safe_alloc[MAXP][M] = {{1,0}, {0,1}, {1,1}};
++  int safe_req[MAXP][M] = {{0,1}, {1,0}, {0,0}};
++  int bank_alloc[MAXP][M] = {{1,0}, {0,1}, {0,0}};
++  int bank_max[MAXP][M] = {{2,1}, {2,1}, {0,0}};
++  int bank_need[MAXP][M];
++  int dead_avail[M] = {0,0};
++  int safe_avail[M] = {0,0};
++  int bank_avail[M] = {1,1};
++  int req[M] = {1,0};
++  int result[MAXP], sequence[MAXP], count, i;
++
++  printf(1, "Q3: resource deadlock detection and Banker's safety\n");
++  print_state("Test 1: circular wait", 3, dead_alloc, dead_req, dead_avail);
++  count = detect_deadlock(3, dead_alloc, dead_req, dead_avail, result);
++  printf(1, "Deadlocked processes:");
++  for(i = 0; i < count; i++) printf(1, " P%d", result[i]);
++  printf(1, "\n");
++
++  print_state("Test 2: safe allocation", 3, safe_alloc, safe_req, safe_avail);
++  count = detect_deadlock(3, safe_alloc, safe_req, safe_avail, result);
++  if(count == 0) printf(1, "Result: no deadlock\n");
++
++  compute_need(2, bank_alloc, bank_max, bank_need);
++  print_state("Test 3: initially safe Banker state", 2, bank_alloc,
++              bank_need, bank_avail);
++  if(is_safe_state(2, bank_alloc, bank_need, bank_avail, sequence))
++    printf(1, "Initial state is safe\n");
++  banker_request(2, 1, req, bank_alloc, bank_need, bank_avail, sequence);
++
++  pipe_deadlock_demo(dead_alloc, dead_req, dead_avail);
++  exit();
++}

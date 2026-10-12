@@ -1,0 +1,391 @@
+diff --git a/Makefile b/Makefile
+index 7f6d8f7..a710799 100644
+--- a/Makefile
++++ b/Makefile
+@@ -15,6 +15,7 @@ OBJS = \
+ 	picirq.o\
+ 	pipe.o\
+ 	proc.o\
++	semaphore.o\
+ 	sleeplock.o\
+ 	spinlock.o\
+ 	string.o\
+@@ -182,6 +183,7 @@ UPROGS=\
+ 	_wc\
+ 	_zombie\
+ 	_threadtest\
++	_synctest\
+ 
+ fs.img: mkfs README $(UPROGS)
+ 	./mkfs fs.img README $(UPROGS)
+diff --git a/defs.h b/defs.h
+index eab6b0e..f98013b 100644
+--- a/defs.h
++++ b/defs.h
+@@ -116,6 +116,10 @@ void            pinit(void);
+ void            procdump(void);
+ void            scheduler(void) __attribute__((noreturn));
+ void            sched(void);
++void            seminit(void);
++int             sem_init_kernel(int, int);
++int             sem_wait_kernel(int);
++int             sem_signal_kernel(int);
+ void            setproc(struct proc*);
+ void            sleep(void*, struct spinlock*);
+ void            userinit(void);
+diff --git a/main.c b/main.c
+index 9924e64..432888e 100644
+--- a/main.c
++++ b/main.c
+@@ -27,6 +27,7 @@ main(void)
+   consoleinit();   // console hardware
+   uartinit();      // serial port
+   pinit();         // process table
++  seminit();       // counting semaphore table
+   tvinit();        // trap vectors
+   binit();         // buffer cache
+   fileinit();      // file table
+diff --git a/semaphore.c b/semaphore.c
+new file mode 100644
+index 0000000..0be9ea4
+--- /dev/null
++++ b/semaphore.c
+@@ -0,0 +1,104 @@
++#include "types.h"
++#include "defs.h"
++#include "param.h"
++#include "memlayout.h"
++#include "mmu.h"
++#include "x86.h"
++#include "proc.h"
++#include "spinlock.h"
++#include "semaphore.h"
++
++static struct {
++  struct spinlock lock;
++  struct semaphore table[NSEMAPHORES];
++} sems;
++
++void
++seminit(void)
++{
++  int i;
++
++  initlock(&sems.lock, "semaphore table");
++  for(i = 0; i < NSEMAPHORES; i++){
++    sems.table[i].value = 0;
++    sems.table[i].initialized = 0;
++    sems.table[i].waiters = 0;
++    initlock(&sems.table[i].lk, "semaphore");
++  }
++}
++
++int
++sem_init_kernel(int id, int value)
++{
++  struct semaphore *s;
++
++  if(id < 0 || id >= NSEMAPHORES || value < 0)
++    return -1;
++  acquire(&sems.lock);
++  s = &sems.table[id];
++  acquire(&s->lk);
++  if(s->waiters != 0){
++    release(&s->lk);
++    release(&sems.lock);
++    return -1;
++  }
++  s->value = value;
++  s->initialized = 1;
++  release(&s->lk);
++  release(&sems.lock);
++  return 0;
++}
++
++int
++sem_wait_kernel(int id)
++{
++  struct semaphore *s;
++
++  if(id < 0 || id >= NSEMAPHORES)
++    return -1;
++  acquire(&sems.lock);
++  s = &sems.table[id];
++  if(!s->initialized){
++    release(&sems.lock);
++    return -1;
++  }
++  acquire(&s->lk);
++  release(&sems.lock);
++
++  s->value--;
++  if(s->value < 0){
++    s->waiters++;
++    sleep(s, &s->lk);         // signal() transfers one permit to this waiter
++    s->waiters--;
++    if(myproc()->killed){
++      s->value++;              // undo this wait if kill() was the wakeup
++      release(&s->lk);
++      return -1;
++    }
++  }
++  release(&s->lk);
++  return 0;
++}
++
++int
++sem_signal_kernel(int id)
++{
++  struct semaphore *s;
++
++  if(id < 0 || id >= NSEMAPHORES)
++    return -1;
++  acquire(&sems.lock);
++  s = &sems.table[id];
++  if(!s->initialized){
++    release(&sems.lock);
++    return -1;
++  }
++  acquire(&s->lk);
++  release(&sems.lock);
++
++  s->value++;
++  if(s->value <= 0)
++    wakeup(s);
++  release(&s->lk);
++  return 0;
++}
+diff --git a/semaphore.h b/semaphore.h
+new file mode 100644
+index 0000000..c358a63
+--- /dev/null
++++ b/semaphore.h
+@@ -0,0 +1,15 @@
++#ifndef XV6_SEMAPHORE_H
++#define XV6_SEMAPHORE_H
++
++#include "spinlock.h"
++
++#define NSEMAPHORES 10
++
++struct semaphore {
++  int value;
++  int initialized;
++  int waiters;
++  struct spinlock lk;
++};
++
++#endif
+diff --git a/synctest.c b/synctest.c
+new file mode 100644
+index 0000000..aec2f19
+--- /dev/null
++++ b/synctest.c
+@@ -0,0 +1,109 @@
++#include "types.h"
++#include "stat.h"
++#include "user.h"
++
++#define NTHREADS 3
++#define STACKSIZE 4096
++#define ITERATIONS 100000
++#define BUFSIZE 5
++#define ITEMS 12
++
++static char stacks[NTHREADS + 2][STACKSIZE] __attribute__((aligned(4096)));
++static int worker_ids[NTHREADS];
++static volatile int counter;
++static int buffer[BUFSIZE];
++static int head, tail;
++
++static void
++counter_worker(void *arg)
++{
++  int i;
++
++  (void)arg;
++  for(i = 0; i < ITERATIONS; i++){
++    if(sem_wait(0) < 0){
++      printf(1, "sem_wait(counter) failed\n");
++      return;
++    }
++    counter++;
++    sem_signal(0);
++  }
++}
++
++static void
++producer(void *arg)
++{
++  int i;
++
++  (void)arg;
++  for(i = 1; i <= ITEMS; i++){
++    sem_wait(1);              // empty slots
++    sem_wait(3);              // buffer mutex
++    buffer[tail] = i;
++    tail = (tail + 1) % BUFSIZE;
++    printf(1, "produced %d\n", i);
++    sem_signal(3);
++    sem_signal(2);            // full slots
++  }
++}
++
++static void
++consumer(void *arg)
++{
++  int i, item;
++
++  (void)arg;
++  for(i = 0; i < ITEMS; i++){
++    sem_wait(2);              // full slots
++    sem_wait(3);              // buffer mutex
++    item = buffer[head];
++    head = (head + 1) % BUFSIZE;
++    printf(1, "consumed %d\n", item);
++    sem_signal(3);
++    sem_signal(1);            // empty slots
++  }
++}
++
++int
++main(void)
++{
++  int i;
++
++  if(sem_init(0, 1) < 0){
++    printf(1, "sem_init failed\n");
++    exit();
++  }
++  printf(1, "Q2: protected counter, %d threads x %d increments\n",
++         NTHREADS, ITERATIONS);
++  for(i = 0; i < NTHREADS; i++){
++    worker_ids[i] = i;
++    if(clone(counter_worker, &worker_ids[i], stacks[i]) < 0){
++      printf(1, "clone failed\n");
++      exit();
++    }
++  }
++  for(i = 0; i < NTHREADS; i++)
++    if(join() < 0){
++      printf(1, "join failed\n");
++      exit();
++    }
++  printf(1, "Q2 counter result: %d (expected 300000)\n", counter);
++
++  if(sem_init(1, BUFSIZE) < 0 || sem_init(2, 0) < 0 || sem_init(3, 1) < 0){
++    printf(1, "producer-consumer sem_init failed\n");
++    exit();
++  }
++  head = tail = 0;
++  if(clone(producer, 0, stacks[NTHREADS]) < 0 ||
++     clone(consumer, 0, stacks[NTHREADS + 1]) < 0){
++    printf(1, "producer-consumer clone failed\n");
++    exit();
++  }
++  if(join() < 0 || join() < 0){
++    printf(1, "producer-consumer join failed\n");
++    exit();
++  }
++  printf(1, "Q2 producer-consumer complete: %d items, buffer size %d\n",
++         ITEMS, BUFSIZE);
++  exit();
++}
+diff --git a/syscall.c b/syscall.c
+index d69016c..58447e9 100644
+--- a/syscall.c
++++ b/syscall.c
+@@ -100,6 +100,9 @@ extern int sys_open(void);
+ extern int sys_pipe(void);
+ extern int sys_read(void);
+ extern int sys_sbrk(void);
++extern int sys_sem_init(void);
++extern int sys_sem_wait(void);
++extern int sys_sem_signal(void);
+ extern int sys_sleep(void);
+ extern int sys_unlink(void);
+ extern int sys_wait(void);
+@@ -130,6 +133,9 @@ static int (*syscalls[])(void) = {
+ [SYS_close]   sys_close,
+ [SYS_clone]   sys_clone,
+ [SYS_join]    sys_join,
++[SYS_sem_init]   sys_sem_init,
++[SYS_sem_wait]   sys_sem_wait,
++[SYS_sem_signal] sys_sem_signal,
+ };
+ 
+ void
+diff --git a/syscall.h b/syscall.h
+index 6b757d1..8b41032 100644
+--- a/syscall.h
++++ b/syscall.h
+@@ -22,3 +22,6 @@
+ #define SYS_close  21
+ #define SYS_clone  22
+ #define SYS_join   23
++#define SYS_sem_init    24
++#define SYS_sem_wait    25
++#define SYS_sem_signal  26
+diff --git a/sysproc.c b/sysproc.c
+index 41bc920..8bc523e 100644
+--- a/sysproc.c
++++ b/sysproc.c
+@@ -31,6 +31,33 @@ sys_join(void)
+   return join();
+ }
+ 
++int
++sys_sem_init(void)
++{
++  int id, value;
++  if(argint(0, &id) < 0 || argint(1, &value) < 0)
++    return -1;
++  return sem_init_kernel(id, value);
++}
++
++int
++sys_sem_wait(void)
++{
++  int id;
++  if(argint(0, &id) < 0)
++    return -1;
++  return sem_wait_kernel(id);
++}
++
++int
++sys_sem_signal(void)
++{
++  int id;
++  if(argint(0, &id) < 0)
++    return -1;
++  return sem_signal_kernel(id);
++}
++
+ int
+ sys_exit(void)
+ {
+diff --git a/user.h b/user.h
+index 6f0455d..4d62dfa 100644
+--- a/user.h
++++ b/user.h
+@@ -5,6 +5,9 @@ struct rtcdate;
+ int fork(void);
+ int clone(void (*fcn)(void*), void *arg, void *stack);
+ int join(void);
++int sem_init(int sem_id, int value);
++int sem_wait(int sem_id);
++int sem_signal(int sem_id);
+ int exit(void) __attribute__((noreturn));
+ int wait(void);
+ int pipe(int*);
+diff --git a/usys.S b/usys.S
+index a62d7b6..a5ecb7a 100644
+--- a/usys.S
++++ b/usys.S
+@@ -35,3 +35,6 @@ SYSCALL(sbrk)
+ SYSCALL(sleep)
+ SYSCALL(uptime)
+ SYSCALL(join)
++SYSCALL(sem_init)
++SYSCALL(sem_wait)
++SYSCALL(sem_signal)

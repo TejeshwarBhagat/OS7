@@ -1,0 +1,466 @@
+diff --git a/Makefile b/Makefile
+index fb5e10e..6dc522b 100644
+--- a/Makefile
++++ b/Makefile
+@@ -185,6 +185,7 @@ UPROGS=\
+ 	_threadtest\
+ 	_synctest\
+ 	_deadlock\
++	_priotest\
+ 
+ fs.img: mkfs README $(UPROGS)
+ 	./mkfs fs.img README $(UPROGS)
+diff --git a/defs.h b/defs.h
+index f98013b..b435b32 100644
+--- a/defs.h
++++ b/defs.h
+@@ -109,6 +109,9 @@ void            exit(void);
+ int             fork(void);
+ int             growproc(int);
+ int             join(void);
++int             setpriority(int, int);
++int             getpriority(int);
++int             group_is_single(void);
+ int             kill(int);
+ struct cpu*     mycpu(void);
+ struct proc*    myproc();
+@@ -120,6 +123,7 @@ void            seminit(void);
+ int             sem_init_kernel(int, int);
+ int             sem_wait_kernel(int);
+ int             sem_signal_kernel(int);
++void            schedtick(void);
+ void            setproc(struct proc*);
+ void            sleep(void*, struct spinlock*);
+ void            userinit(void);
+diff --git a/exec.c b/exec.c
+index b40134f..e3f1a5b 100644
+--- a/exec.c
++++ b/exec.c
+@@ -19,6 +19,9 @@ exec(char *path, char **argv)
+   pde_t *pgdir, *oldpgdir;
+   struct proc *curproc = myproc();
+ 
++  if(!group_is_single())
++    return -1;
++
+   begin_op();
+ 
+   if((ip = namei(path)) == 0){
+diff --git a/priotest.c b/priotest.c
+new file mode 100644
+index 0000000..e8b7fe5
+--- /dev/null
++++ b/priotest.c
+@@ -0,0 +1,73 @@
++#include "types.h"
++#include "stat.h"
++#include "user.h"
++
++#define NCHILD 4
++#define WORK 200000000
++#define CHECK_EVERY 10000000
++
++static int priorities[NCHILD] = {1, 5, 10, 20};
++
++int
++main(void)
++{
++  int i, pid, initial, current, start, finish, next_check;
++  int gate[2];
++  char release;
++  volatile uint work;
++
++  printf(1, "Q4: priority preemption and aging (1=high, 20=low)\n");
++  if(pipe(gate) < 0){
++    printf(1, "barrier pipe failed\n");
++    exit();
++  }
++  for(i = 0; i < NCHILD; i++){
++    pid = fork();
++    if(pid < 0){
++      printf(1, "fork failed\n");
++      exit();
++    }
++    if(pid == 0){
++      close(gate[1]);
++      if(read(gate[0], &release, 1) != 1)
++        exit();
++      close(gate[0]);
++      initial = get_priority(getpid());
++      printf(1, "start pid=%d priority=%d\n", getpid(), initial);
++      start = uptime();
++      next_check = CHECK_EVERY;
++      for(work = 0; work < WORK; work++){
++        if(work == next_check){
++          current = get_priority(getpid());
++          if(current != initial){
++            printf(1, "child pid=%d priority aged %d->%d\n",
++                   getpid(), initial, current);
++            initial = current;
++          }
++          next_check += CHECK_EVERY;
++        }
++      }
++      finish = uptime();
++      printf(1, "complete pid=%d priority=%d ticks=%d\n",
++             getpid(), get_priority(getpid()), finish - start);
++      exit();
++    }
++    if(set_priority(pid, priorities[i]) < 0){
++      printf(1, "set_priority failed for pid=%d\n", pid);
++      exit();
++    }
++    printf(1, "forked pid=%d priority=%d\n", pid, get_priority(pid));
++  }
++  close(gate[0]);
++  release = 'x';
++  for(i = 0; i < NCHILD; i++)
++    if(write(gate[1], &release, 1) != 1){
++      printf(1, "barrier release failed\n");
++      exit();
++    }
++  close(gate[1]);
++  for(i = 0; i < NCHILD; i++)
++    wait();
++  printf(1, "Q4 complete: all children finished; age events appear above\n");
++  exit();
++}
+diff --git a/proc.c b/proc.c
+index 305641a..a47f1f9 100644
+--- a/proc.c
++++ b/proc.c
+@@ -9,6 +9,7 @@
+ 
+ struct {
+   struct spinlock lock;
++  int last_index;
+   struct proc proc[NPROC];
+ } ptable;
+ 
+@@ -36,6 +37,8 @@ freeproc(struct proc *p)
+   p->is_thread = 0;
+   p->group_leader = 0;
+   p->group_threads = 0;
++  p->priority = 10;
++  p->wait_ticks = 0;
+   p->tf = 0;
+   p->context = 0;
+   p->chan = 0;
+@@ -49,6 +52,7 @@ void
+ pinit(void)
+ {
+   initlock(&ptable.lock, "ptable");
++  ptable.last_index = NPROC - 1;
+ }
+ 
+ // Must be called with interrupts disabled
+@@ -119,6 +123,8 @@ found:
+   p->is_thread = 0;
+   p->group_leader = p;
+   p->group_threads = 0;
++  p->priority = 10;
++  p->wait_ticks = 0;
+   p->tf = 0;
+   p->context = 0;
+   p->chan = 0;
+@@ -201,6 +207,8 @@ growproc(int n)
+   uint sz;
+   struct proc *curproc = myproc();
+ 
++  if(!group_is_single())
++    return -1;
+   sz = curproc->sz;
+   if(n > 0){
+     if((sz = allocuvm(curproc->pgdir, sz, sz + n)) == 0)
+@@ -293,6 +301,7 @@ clone(void (*fcn)(void*), void *arg, void *stack, void (*ret)(void))
+   np->parent = curproc;
+   np->is_thread = 1;
+   np->group_leader = curproc->group_leader;
++  np->priority = curproc->priority;
+   *np->tf = *curproc->tf;
+   np->tf->eip = (uint)fcn;
+   np->tf->eax = 0;
+@@ -491,26 +500,37 @@ join(void)
+ void
+ scheduler(void)
+ {
+-  struct proc *p;
++  struct proc *p, *best;
+   struct cpu *c = mycpu();
++  int i, index, start;
+   c->proc = 0;
+   
+   for(;;){
+     // Enable interrupts on this processor.
+     sti();
+ 
+-    // Loop over process table looking for process to run.
++    // Choose the lowest numeric priority. Circular scanning keeps ties
++    // round-robin across the process table.
+     acquire(&ptable.lock);
+-    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+-      if(p->state != RUNNABLE)
+-        continue;
+-
++    best = 0;
++    start = (ptable.last_index + 1) % NPROC;
++    for(i = 0; i < NPROC; i++){
++      index = (start + i) % NPROC;
++      p = &ptable.proc[index];
++      if(p->state == RUNNABLE &&
++         (best == 0 || p->priority < best->priority))
++        best = p;
++    }
++    if(best){
++      p = best;
++      ptable.last_index = p - ptable.proc;
+       // Switch to chosen process.  It is the process's job
+       // to release ptable.lock and then reacquire it
+       // before jumping back to us.
+       c->proc = p;
+       switchuvm(p);
+       p->state = RUNNING;
++      p->wait_ticks = 0;
+ 
+       swtch(&(c->scheduler), p->context);
+       switchkvm();
+@@ -555,6 +575,7 @@ void
+ yield(void)
+ {
+   acquire(&ptable.lock);  //DOC: yieldlock
++  myproc()->wait_ticks = 0;
+   myproc()->state = RUNNABLE;
+   sched();
+   release(&ptable.lock);
+@@ -629,8 +650,10 @@ wakeup1(void *chan)
+   struct proc *p;
+ 
+   for(p = ptable.proc; p < &ptable.proc[NPROC]; p++)
+-    if(p->state == SLEEPING && p->chan == chan)
++    if(p->state == SLEEPING && p->chan == chan){
+       p->state = RUNNABLE;
++      p->wait_ticks = 0;
++    }
+ }
+ 
+ // Wake up all processes sleeping on chan.
+@@ -655,8 +678,71 @@ kill(int pid)
+     if(p->pid == pid){
+       p->killed = 1;
+       // Wake process from sleep if necessary.
+-      if(p->state == SLEEPING)
++      if(p->state == SLEEPING){
+         p->state = RUNNABLE;
++        p->wait_ticks = 0;
++      }
++      release(&ptable.lock);
++      return 0;
++    }
++  }
++  release(&ptable.lock);
++  return -1;
++}
++
++// Called once per clock tick by CPU 0. A runnable process waiting for more
++// than 30 ticks gains one priority level, which prevents starvation.
++void
++schedtick(void)
++{
++  struct proc *p;
++  struct ageevent {
++    int pid;
++    int waited;
++    int old;
++    int new;
++  } aged[NPROC];
++  int i, n;
++
++  n = 0;
++  acquire(&ptable.lock);
++  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++    if(p->state != RUNNABLE){
++      p->wait_ticks = 0;
++      continue;
++    }
++    p->wait_ticks++;
++    if(p->wait_ticks > 30){
++      aged[n].pid = p->pid;
++      aged[n].waited = p->wait_ticks;
++      aged[n].old = p->priority;
++      if(p->priority > 1)
++        p->priority--;
++      aged[n].new = p->priority;
++      n++;
++      p->wait_ticks = 0;
++    }
++  }
++  release(&ptable.lock);
++
++  for(i = 0; i < n; i++)
++    if(aged[i].old != aged[i].new)
++      cprintf("aging: pid %d waited %d ticks; priority %d->%d\n",
++              aged[i].pid, aged[i].waited, aged[i].old, aged[i].new);
++}
++
++int
++setpriority(int pid, int priority)
++{
++  struct proc *p;
++
++  if(priority < 1 || priority > 20)
++    return -1;
++  acquire(&ptable.lock);
++  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++    if(p->state != UNUSED && p->pid == pid){
++      p->priority = priority;
++      p->wait_ticks = 0;
+       release(&ptable.lock);
+       return 0;
+     }
+@@ -665,6 +751,37 @@ kill(int pid)
+   return -1;
+ }
+ 
++int
++getpriority(int pid)
++{
++  struct proc *p;
++  int priority;
++
++  priority = -1;
++  acquire(&ptable.lock);
++  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++)
++    if(p->state != UNUSED && p->pid == pid){
++      priority = p->priority;
++      break;
++    }
++  release(&ptable.lock);
++  return priority;
++}
++
++// Operations that replace or resize a page table are safe only when called
++// by the address-space leader with no live clone() threads.
++int
++group_is_single(void)
++{
++  struct proc *p = myproc();
++  int single;
++
++  acquire(&ptable.lock);
++  single = !p->is_thread && p->group_leader == p && p->group_threads == 0;
++  release(&ptable.lock);
++  return single;
++}
++
+ //PAGEBREAK: 36
+ // Print a process listing to console.  For debugging.
+ // Runs when user types ^P on console.
+diff --git a/proc.h b/proc.h
+index 44683d4..b0ac0e1 100644
+--- a/proc.h
++++ b/proc.h
+@@ -45,6 +45,8 @@ struct proc {
+   int is_thread;               // Shares the address space with group_leader
+   struct proc *group_leader;   // Process that owns this address space
+   int group_threads;           // Live threads in this address-space group
++  int priority;                // 1 is highest, 20 is lowest
++  int wait_ticks;              // Runnable ticks since last scheduled
+   struct trapframe *tf;        // Trap frame for current syscall
+   struct context *context;     // swtch() here to run process
+   void *chan;                  // If non-zero, sleeping on chan
+diff --git a/syscall.c b/syscall.c
+index 58447e9..0dac2dd 100644
+--- a/syscall.c
++++ b/syscall.c
+@@ -103,6 +103,8 @@ extern int sys_sbrk(void);
+ extern int sys_sem_init(void);
+ extern int sys_sem_wait(void);
+ extern int sys_sem_signal(void);
++extern int sys_set_priority(void);
++extern int sys_get_priority(void);
+ extern int sys_sleep(void);
+ extern int sys_unlink(void);
+ extern int sys_wait(void);
+@@ -136,6 +138,8 @@ static int (*syscalls[])(void) = {
+ [SYS_sem_init]   sys_sem_init,
+ [SYS_sem_wait]   sys_sem_wait,
+ [SYS_sem_signal] sys_sem_signal,
++[SYS_set_priority] sys_set_priority,
++[SYS_get_priority] sys_get_priority,
+ };
+ 
+ void
+diff --git a/syscall.h b/syscall.h
+index 8b41032..5e54b57 100644
+--- a/syscall.h
++++ b/syscall.h
+@@ -25,3 +25,5 @@
+ #define SYS_sem_init    24
+ #define SYS_sem_wait    25
+ #define SYS_sem_signal  26
++#define SYS_set_priority 27
++#define SYS_get_priority 28
+diff --git a/sysproc.c b/sysproc.c
+index 8bc523e..1b72cd5 100644
+--- a/sysproc.c
++++ b/sysproc.c
+@@ -58,6 +58,24 @@ sys_sem_signal(void)
+   return sem_signal_kernel(id);
+ }
+ 
++int
++sys_set_priority(void)
++{
++  int pid, priority;
++  if(argint(0, &pid) < 0 || argint(1, &priority) < 0)
++    return -1;
++  return setpriority(pid, priority);
++}
++
++int
++sys_get_priority(void)
++{
++  int pid;
++  if(argint(0, &pid) < 0)
++    return -1;
++  return getpriority(pid);
++}
++
+ int
+ sys_exit(void)
+ {
+diff --git a/trap.c b/trap.c
+index 41c66eb..e95e69a 100644
+--- a/trap.c
++++ b/trap.c
+@@ -53,6 +53,7 @@ trap(struct trapframe *tf)
+       ticks++;
+       wakeup(&ticks);
+       release(&tickslock);
++      schedtick();
+     }
+     lapiceoi();
+     break;
+diff --git a/user.h b/user.h
+index 4d62dfa..c432520 100644
+--- a/user.h
++++ b/user.h
+@@ -8,6 +8,8 @@ int join(void);
+ int sem_init(int sem_id, int value);
+ int sem_wait(int sem_id);
+ int sem_signal(int sem_id);
++int set_priority(int pid, int priority);
++int get_priority(int pid);
+ int exit(void) __attribute__((noreturn));
+ int wait(void);
+ int pipe(int*);
+diff --git a/usys.S b/usys.S
+index a5ecb7a..91cd74e 100644
+--- a/usys.S
++++ b/usys.S
+@@ -38,3 +38,5 @@ SYSCALL(join)
+ SYSCALL(sem_init)
+ SYSCALL(sem_wait)
+ SYSCALL(sem_signal)
++SYSCALL(set_priority)
++SYSCALL(get_priority)
